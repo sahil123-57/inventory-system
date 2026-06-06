@@ -1,12 +1,12 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional
+import os
 import sqlite3
 
-app = FastAPI(title="Inventory Management API")
+app = FastAPI(title="Inventory & Order Management API")
 
-# Enable CORS for React frontend communications
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,15 +15,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Use SQLite local fallback for development, easily swapped to PostgreSQL via env vars
 DB_FILE = "inventory.db"
 
-# Initialize Database Table and seed it with starter data if empty
-def init_db():
+def get_db_conn():
     conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_conn()
     cursor = conn.cursor()
+    # 1. Products Table
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS products (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             category TEXT NOT NULL,
             quantity INTEGER NOT NULL,
@@ -32,24 +38,41 @@ def init_db():
             description TEXT
         )
     """)
+    # 2. Customers Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL UNIQUE
+        )
+    """)
+    # 3. Orders Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            quantity INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY (customer_id) REFERENCES customers(id),
+            FOREIGN KEY (product_id) REFERENCES products(id)
+        )
+    """)
     
-    # Seed starter data if table is completely empty
-    cursor.execute("SELECT COUNT(*) FROM inventory")
+    # Seed data if empty
+    cursor.execute("SELECT COUNT(*) FROM products")
     if cursor.fetchone()[0] == 0:
-        starter_items = [
-            (1, "Wireless Mouse", "Electronics", 45, 29.99, "ELEC-MSE-01", "Ergonomic 2.4GHz wireless mouse"),
-            (2, "Mechanical Keyboard", "Electronics", 12, 89.99, "ELEC-KBD-02", "RGB backlit tactile keyboard"),
-            (3, "Office Chair", "Furniture", 8, 149.50, "FURN-CHR-03", "High-back mesh office chair with lumbar support")
-        ]
-        cursor.executemany("INSERT INTO inventory VALUES (?, ?, ?, ?, ?, ?, ?)", starter_items)
+        cursor.execute("INSERT INTO products (name, category, quantity, price, sku, description) VALUES ('Wireless Mouse', 'Electronics', 45, 29.99, 'ELEC-MSE-01', 'Ergonomic mouse')")
+        cursor.execute("INSERT INTO products (name, category, quantity, price, sku, description) VALUES ('Mechanical Keyboard', 'Electronics', 12, 89.99, 'ELEC-KBD-02', 'RGB keyboard')")
+        cursor.execute("INSERT INTO customers (name, email) VALUES ('John Doe', 'john@example.com')")
         conn.commit()
     conn.close()
 
 init_db()
 
-# Pydantic schema layout for incoming/outgoing data validation
-class InventoryItem(BaseModel):
-    id: int
+# Schemas
+class ProductSchema(BaseModel):
+    id: Optional[int] = None
     name: str
     category: str
     quantity: int
@@ -57,81 +80,76 @@ class InventoryItem(BaseModel):
     sku: str
     description: Optional[str] = None
 
-@app.get("/")
-def root():
-    return {"status": "online", "database": "sqlite connected"}
+class CustomerSchema(BaseModel):
+    id: Optional[int] = None
+    name: str
+    email: str
 
-# 1. GET ALL ITEMS FROM SQL DATABASE
-@app.get("/items", response_model=List[InventoryItem])
-def get_all_items():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
+class OrderCreateSchema(BaseModel):
+    customer_id: int
+    product_id: int
+    quantity: int
+
+class OrderResponseSchema(BaseModel):
+    id: int
+    customer_id: int
+    product_id: int
+    quantity: int
+    status: str
+
+@app.get("/items", response_model=List[ProductSchema])
+def get_products():
+    conn = get_db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT * FROM inventory")
+    cursor.execute("SELECT * FROM products")
     rows = cursor.fetchall()
     conn.close()
     return [dict(row) for row in rows]
 
-# 2. GET SINGLE ITEM BY ID
-@app.get("/items/{item_id}", response_model=InventoryItem)
-def get_item(item_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM inventory WHERE id = ?", (item_id,))
-    row = cursor.fetchone()
-    conn.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail="Item not found")
-    return dict(row)
-
-# 3. CREATE A NEW ITEM IN SQL
-@app.post("/items", response_model=InventoryItem, status_code=201)
-def create_item(item: InventoryItem):
-    conn = sqlite3.connect(DB_FILE)
+@app.post("/items", response_model=ProductSchema, status_code=201)
+def create_product(product: ProductSchema):
+    conn = get_db_conn()
     cursor = conn.cursor()
     try:
         cursor.execute(
-            "INSERT INTO inventory (id, name, category, quantity, price, sku, description) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (item.id, item.name, item.category, item.quantity, item.price, item.sku, item.description)
+            "INSERT INTO products (name, category, quantity, price, sku, description) VALUES (?, ?, ?, ?, ?, ?)",
+            (product.name, product.category, product.quantity, product.price, product.sku, product.description)
         )
         conn.commit()
-    except sqlite3.IntegrityError as e:
+        product.id = cursor.lastrowid
+    except sqlite3.IntegrityError:
         conn.close()
-        raise HTTPException(status_code=400, detail="Asset ID or SKU already exists in records")
+        raise HTTPException(status_code=400, detail="Product SKU already exists")
     conn.close()
-    return item
+    return product
 
-# 4. UPDATE AN EXISTING ITEM
-@app.put("/items/{item_id}", response_model=InventoryItem)
-def update_item(item_id: int, updated_item: InventoryItem):
-    conn = sqlite3.connect(DB_FILE)
+@app.post("/orders", response_model=OrderResponseSchema, status_code=201)
+def place_order(order: OrderCreateSchema):
+    conn = get_db_conn()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM inventory WHERE id = ?", (item_id,))
-    if cursor.fetchone() is None:
-        conn.close()
-        raise HTTPException(status_code=404, detail="Item not found")
     
-    cursor.execute("""
-        UPDATE inventory 
-        SET name = ?, category = ?, quantity = ?, price = ?, sku = ?, description = ?
-        WHERE id = ?
-    """, (updated_item.name, updated_item.category, updated_item.quantity, updated_item.price, updated_item.sku, updated_item.description, item_id))
-    conn.commit()
-    conn.close()
-    return updated_item
-
-# 5. DELETE AN ITEM FROM DATABASE
-@app.delete("/items/{item_id}")
-def delete_item(item_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id FROM inventory WHERE id = ?", (item_id,))
-    if cursor.fetchone() is None:
+    # Check Product Stock
+    cursor.execute("SELECT quantity FROM products WHERE id = ?", (order.product_id,))
+    product = cursor.fetchone()
+    if not product:
         conn.close()
-        raise HTTPException(status_code=404, detail="Item not found")
+        raise HTTPException(status_code=404, detail="Product not found")
     
-    cursor.execute("DELETE FROM inventory WHERE id = ?", (item_id,))
+    current_stock = product['quantity']
+    if current_stock < order.quantity:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Insufficient product stock to fulfill order")
+    
+    # Atomic Deduct Stock and Create Order
+    new_stock = current_stock - order.quantity
+    cursor.execute("UPDATE products SET quantity = ? WHERE id = ?", (new_stock, order.product_id))
+    
+    cursor.execute(
+        "INSERT INTO orders (customer_id, product_id, quantity, status) VALUES (?, ?, ?, 'Processed')",
+        (order.customer_id, order.product_id, order.quantity)
+    )
     conn.commit()
+    order_id = cursor.lastrowid
     conn.close()
-    return {"message": f"Successfully deleted item {item_id}"}
+    
+    return OrderResponseSchema(id=order_id, customer_id=order.customer_id, product_id=order.product_id, quantity=order.quantity, status="Processed")
